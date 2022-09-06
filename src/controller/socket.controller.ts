@@ -1,11 +1,13 @@
 import {
   WSController,
-  OnWSConnection,
   Inject,
   OnWSMessage,
+  OnWSDisConnection,
+  Init,
 } from '@midwayjs/decorator';
 import { Context } from '@midwayjs/socketio';
 import { Client } from 'ssh2';
+import { EventEmitter } from 'events';
 const utf8 = require('utf8');
 
 export interface WindowSize {
@@ -17,24 +19,24 @@ export interface WindowSize {
 
 const ClientMessageMap = new Map<string, WindowSize>();
 
-function createNewServer(machineConfig, socket) {
+function createNewServer(machineConfig, socket, event: EventEmitter) {
   const ssh = new Client();
   const { msgId, ip, username, password } = machineConfig;
+  let loginIng = true; // 是否正在登录
   ssh
     .on('ready', () => {
+      // 注册event 事件
       socket.emit(
         msgId,
         '\r\n***' + ip + ' SSH CONNECTION ESTABLISHED ***\r\n'
       );
       ssh.shell((err, stream) => {
         if (err) {
-          return socket.emit(
-            msgId,
-            '\r\n*** SSH SHELL ERROR: ' + err.message + ' ***\r\n'
-          );
+          return socket.emit('login', { status: 0, message: err.message });
         }
 
         socket.emit('login', { status: 0 });
+        loginIng = false;
 
         socket.on('user_input', data => {
           const {
@@ -43,16 +45,19 @@ function createNewServer(machineConfig, socket) {
             w,
             h,
           } = ClientMessageMap.get(socket.id) || {};
-          console.log('[BUTTERFLY][15:25:13]', rows, cols, w, h);
           rows !== 0 &&
             stream.setWindow(
               rows.toString(),
               (cols + 1).toString(),
-              // cols.toString(),
               h.toString(),
               w.toString()
             );
           stream.write(data);
+        });
+
+        event.once(`${msgId}_exit`, () => {
+          stream.close();
+          socket.emit('exit_server');
         });
 
         stream
@@ -65,22 +70,22 @@ function createNewServer(machineConfig, socket) {
       });
     })
     .on('close', () => {
-      socket.emit(msgId, '\r\n*** SSH CONNECTION CLOSED ***\r\n');
+      socket.emit('exit_server');
     })
     .on('error', err => {
-      console.log(err);
+      console.error(err);
       socket.emit(
         msgId,
         '\r\n*** SSH CONNECTION ERROR: ' + err.message + ' ***\r\n'
       );
+      // 当正在登录时
+      if (loginIng) socket.emit('login', { status: -1 });
     })
     .connect({
       host: ip,
       port: 22,
       username: username,
       password: password,
-      keepaliveInterval: 3 * 1000, // 毫秒
-      keepaliveCountMax: 2,
     });
 }
 
@@ -89,26 +94,40 @@ export class HelloSocketController {
   @Inject()
   ctx: Context;
 
-  @OnWSConnection()
-  async content() {
-    console.log('链接成功');
+  event: EventEmitter;
+
+  @Init()
+  async() {
+    this.event = new EventEmitter();
   }
 
   @OnWSMessage('login')
   async gotMessage(data) {
-    console.log('[BUTTERFLY][17:39:28]', data);
     createNewServer(
       {
         ...data,
         msgId: this.ctx.id,
       },
-      this.ctx
+      this.ctx,
+      this.event
     );
   }
 
-  @OnWSMessage('reszie')
-  async reszie(data: WindowSize) {
-    console.log('[BUTTERFLY][15:00:18]', data);
+  @OnWSMessage('resize')
+  async resize(data: WindowSize) {
     ClientMessageMap.set(this.ctx.id, data);
+    this.ctx.emit('resize');
+  }
+
+  @OnWSMessage('exit')
+  async exitSSHByTimeOut() {
+    ClientMessageMap.delete(this.ctx.id);
+    this.event.emit(`${this.ctx.id}_exit`);
+  }
+
+  @OnWSDisConnection()
+  async discontent() {
+    ClientMessageMap.delete(this.ctx.id);
+    this.event.emit(`${this.ctx.id}_exit`);
   }
 }
